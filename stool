@@ -1,0 +1,137 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -e
+
+VERSION="1.0.0"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE="$ROOT/template"
+
+die(){ echo "STOOL: $*" >&2; exit 1; }
+slug(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//'; }
+valid_pkg(){ echo "$1" | grep -Eq '^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$'; }
+
+usage(){
+cat <<EOF
+STOOL v$VERSION
+HTML -> Android APK builder
+
+Commands:
+  stool help
+  stool new APP_NAME HTML_FOLDER [PACKAGE_NAME] [MODE]
+  stool build PROJECT_DIR
+  stool clean PROJECT_DIR
+  stool version
+
+Modes:
+  offline   local HTML only
+  browser   Internet-enabled WebView
+  hybrid    local HTML + Internet
+
+Example:
+  stool new MyApp ./website com.example.myapp hybrid
+  stool build ./stool-output/MyApp
+EOF
+}
+
+copy_template(){
+  local dest="$1"
+  mkdir -p "$dest"
+  cp -R "$TEMPLATE/." "$dest/"
+}
+
+new_project(){
+  [ "$#" -ge 2 ] || die "Usage: stool new APP_NAME HTML_FOLDER [PACKAGE_NAME] [MODE]"
+  local name="$1" src="$2" pkg="${3:-com.example.$(slug "$1")}" mode="${4:-offline}"
+  [ -d "$src" ] || die "HTML folder not found: $src"
+  valid_pkg "$pkg" || die "Invalid package name: $pkg"
+  case "$mode" in offline|browser|hybrid) ;; *) die "Mode must be offline, browser, or hybrid";; esac
+
+  local out="./stool-output/$name"
+  rm -rf "$out"
+  copy_template "$out"
+
+  local appid="${pkg,,}"
+  local java_pkg="${appid//./\/}"
+  rm -rf "$out/app/src/main/java"
+  mkdir -p "$out/app/src/main/java/$java_pkg"
+
+  sed -e "s/__PACKAGE__/$appid/g" -e "s/__APP_NAME__/$name/g"     "$TEMPLATE/app/src/main/java/com/smob/stoolapp/MainActivity.java"     > "$out/app/src/main/java/$java_pkg/MainActivity.java"
+
+  sed -i "s/__PACKAGE__/$appid/g; s/__APP_NAME__/$name/g; s/__MODE__/$mode/g"     "$out/settings.gradle" "$out/build.gradle" "$out/app/build.gradle"     "$out/app/src/main/AndroidManifest.xml" "$out/app/src/main/assets/index.html"
+
+  rm -rf "$out/app/src/main/assets"
+  mkdir -p "$out/app/src/main/assets"
+  cp -R "$src/." "$out/app/src/main/assets/"
+
+  if [ "$mode" = "offline" ]; then
+    sed -i '/<uses-permission android:name="android.permission.INTERNET" \/>/d'       "$out/app/src/main/AndroidManifest.xml"
+  fi
+
+  cat > "$out/STOOL.json" <<EOF
+{
+  "name": "$(printf '%s' "$name" | sed 's/"/\"/g')",
+  "package": "$appid",
+  "mode": "$mode",
+  "versionName": "1.0",
+  "versionCode": 1
+}
+EOF
+
+  echo
+  echo "Created: $out"
+  echo "Build:   stool build "$out""
+}
+
+build_project(){
+  local dir="${1:-.}"
+  [ -f "$dir/settings.gradle" ] || die "Not a STOOL Android project: $dir"
+  cd "$dir"
+
+  if [ -x ./gradlew ]; then
+    ./gradlew assembleDebug
+  elif command -v gradle >/dev/null 2>&1; then
+    gradle assembleDebug
+  else
+    die "Gradle not found. Use the included GitHub Actions workflow for a cloud build."
+  fi
+
+  local apk
+  apk="$(find app/build/outputs/apk -type f -name '*debug*.apk' | head -n 1)"
+  [ -n "$apk" ] || die "Build finished but APK was not found."
+
+  local downloads="$HOME/storage/downloads"
+  local name
+  name="$(basename "$apk")"
+
+  if [ -d "$HOME/storage" ]; then
+    mkdir -p "$downloads"
+    cp "$apk" "$downloads/$name"
+    apk="$downloads/$name"
+  else
+    apk="$(realpath "$apk")"
+  fi
+
+  echo
+  echo "=============================="
+  echo "STOOL BUILD COMPLETE"
+  echo "APK: $apk"
+  echo "=============================="
+
+  if command -v termux-open >/dev/null 2>&1; then
+    termux-open "$apk" || true
+  fi
+}
+
+clean_project(){
+  [ -n "$1" ] || die "Usage: stool clean PROJECT_DIR"
+  rm -rf "$1/app/build" "$1/.gradle"
+  echo "Cleaned: $1"
+}
+
+case "${1:-help}" in
+  help|-h|--help) usage ;;
+  new) shift; new_project "$@" ;;
+  build) shift; build_project "$@" ;;
+  clean) shift; clean_project "$@" ;;
+  version) echo "$VERSION" ;;
+  *) die "Unknown command. Run: stool help" ;;
+esac
